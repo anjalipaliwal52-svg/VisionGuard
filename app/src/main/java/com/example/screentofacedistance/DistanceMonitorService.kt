@@ -11,18 +11,27 @@ import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.LayoutInflater
+import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.TextView
 import androidx.annotation.OptIn
-import androidx.camera.core.*
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalGetImage
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.google.mlkit.vision.pose.Pose
+import com.google.mlkit.vision.pose.PoseDetection
+import com.google.mlkit.vision.pose.accurate.AccuratePoseDetectorOptions
+import com.google.mlkit.vision.pose.PoseLandmark
 import java.util.concurrent.Executors
 
 class DistanceMonitorService : LifecycleService() {
@@ -30,35 +39,40 @@ class DistanceMonitorService : LifecycleService() {
     companion object {
         private const val TAG = "DistanceService"
         private const val CHANNEL_ID = "distance_channel"
+
         private const val TOO_CLOSE_DISTANCE_CM = 35f
-        private const val ANALYSIS_INTERVAL_MS = 500L
         private const val TOO_CLOSE_CONFIRMATION_MS = 10_000L
+        private const val BAD_POSTURE_CONFIRMATION_MS = 8_000L
+        private const val ANALYSIS_INTERVAL_MS = 500L
         private const val ACTION_STOP = "ACTION_STOP_DISTANCE_SERVICE"
+
+        private const val DISTANCE_ALERT_ID = 101
+        private const val POSTURE_ALERT_ID = 102
     }
 
     private var lastAnalysisTime = 0L
-    private var alertShown = false
     private var tooCloseStartTime: Long? = null
+    private var distanceAlertShown = false
+    private var badPostureStartTime: Long? = null
+    private var postureAlertShown = false
 
     private lateinit var windowManager: WindowManager
     private val cameraExecutor = Executors.newSingleThreadExecutor()
-
-    // 🔹 FIX: track overlay properly
-    private var overlayView: android.view.View? = null
+    private var overlayView: View? = null
 
     private val faceDetector by lazy {
-        val options = FaceDetectorOptions.Builder()
-            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-            .build()
-        FaceDetection.getClient(options)
+        FaceDetection.getClient(
+            FaceDetectorOptions.Builder()
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+                .build()
+        )
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
-        return super.onStartCommand(intent, flags, startId)
+    private val poseDetector by lazy {
+        val options = AccuratePoseDetectorOptions.Builder()
+            .setDetectorMode(AccuratePoseDetectorOptions.STREAM_MODE)
+            .build()
+        PoseDetection.getClient(options)
     }
 
     override fun onCreate() {
@@ -69,32 +83,35 @@ class DistanceMonitorService : LifecycleService() {
         startCameraAnalysis()
     }
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        return super.onStartCommand(intent, flags, startId)
+    }
+
     private fun startCameraAnalysis() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            Log.e(TAG, "Camera permission NOT granted")
-            return
-        }
+            != PackageManager.PERMISSION_GRANTED) return
 
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
-
-            val imageAnalysis = ImageAnalysis.Builder()
+        val providerFuture = ProcessCameraProvider.getInstance(this)
+        providerFuture.addListener({
+            val provider = providerFuture.get()
+            val analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
 
-            imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
+            analysis.setAnalyzer(cameraExecutor) { imageProxy ->
                 processImage(imageProxy)
             }
 
-            cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(
-                this,
-                CameraSelector.DEFAULT_FRONT_CAMERA,
-                imageAnalysis
-            )
+            try {
+                provider.unbindAll()
+                provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+            } catch (e: Exception) {
+                Log.e(TAG, "Binding failed", e)
+            }
         }, ContextCompat.getMainExecutor(this))
     }
 
@@ -112,81 +129,112 @@ class DistanceMonitorService : LifecycleService() {
             return
         }
 
-        val image = InputImage.fromMediaImage(
-            mediaImage,
-            imageProxy.imageInfo.rotationDegrees
-        )
+        val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
 
+        // Face Detection (Distance)
         faceDetector.process(image)
             .addOnSuccessListener { faces ->
                 if (faces.isNotEmpty()) {
-                    val distance = DistanceCalculator.calculateDistance(faces[0])
-                    if (distance < 15 || distance > 100) return@addOnSuccessListener
-
-                    if (distance < TOO_CLOSE_DISTANCE_CM) {
-                        if (tooCloseStartTime == null) {
-                            tooCloseStartTime = SystemClock.elapsedRealtime()
-                        }
-
-                        val duration =
-                            SystemClock.elapsedRealtime() - tooCloseStartTime!!
-
-                        if (duration >= TOO_CLOSE_CONFIRMATION_MS && !alertShown) {
-                            alertShown = true
-                            Handler(Looper.getMainLooper()).post {
-                                showTooCloseOverlay()
-                                showTooCloseNotification()
-                            }
-                        }
-                    } else {
-                        tooCloseStartTime = null
-                        alertShown = false
-                    }
+                    handleDistanceLogic(faces[0], now)
                 }
             }
-            .addOnCompleteListener { imageProxy.close() }
+
+        // Pose Detection (Posture)
+        poseDetector.process(image)
+            .addOnSuccessListener { pose ->
+                handlePostureLogic(pose, now)
+            }
+            .addOnCompleteListener {
+                imageProxy.close()
+            }
+    }
+
+    private fun handleDistanceLogic(face: Face, now: Long) {
+        val distance = DistanceCalculator.calculateDistance(face)
+        if (distance in 15f..TOO_CLOSE_DISTANCE_CM) {
+            if (tooCloseStartTime == null) tooCloseStartTime = now
+            if (now - tooCloseStartTime!! >= TOO_CLOSE_CONFIRMATION_MS && !distanceAlertShown) {
+                distanceAlertShown = true
+                Handler(Looper.getMainLooper()).post {
+                    showTooCloseOverlay()
+                    showTooCloseNotification()
+                }
+            }
+        } else {
+            tooCloseStartTime = null
+            distanceAlertShown = false
+        }
+    }
+
+    private fun handlePostureLogic(pose: Pose, now: Long) {
+        if (isBadPosture(pose)) {
+            if (badPostureStartTime == null) badPostureStartTime = now
+            if (now - badPostureStartTime!! >= BAD_POSTURE_CONFIRMATION_MS && !postureAlertShown) {
+                postureAlertShown = true
+                showPostureNotification()
+            }
+        } else {
+            badPostureStartTime = null
+            postureAlertShown = false
+        }
+    }
+
+    private fun isBadPosture(pose: Pose): Boolean {
+        val leftShoulder = pose.getPoseLandmark(PoseLandmark.LEFT_SHOULDER)
+        val rightShoulder = pose.getPoseLandmark(PoseLandmark.RIGHT_SHOULDER)
+        val leftEar = pose.getPoseLandmark(PoseLandmark.LEFT_EAR)
+        val rightEar = pose.getPoseLandmark(PoseLandmark.RIGHT_EAR)
+
+        if (leftShoulder == null || rightShoulder == null || leftEar == null || rightEar == null)
+            return false
+
+        val shoulderMidY = (leftShoulder.position.y + rightShoulder.position.y) / 2
+        val earMidY = (leftEar.position.y + rightEar.position.y) / 2
+
+        // If the head (ears) sinks too close to the shoulder line, they are slouching
+        // Threshold: 150 pixels (adjust based on testing)
+        return (shoulderMidY - earMidY) < 150f
+    }
+
+    private fun showPostureNotification() {
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle("Bad Posture Detected")
+            .setContentText("Please sit up straight!")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .build()
+
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+            .notify(POSTURE_ALERT_ID, notification)
     }
 
     private fun showTooCloseOverlay() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-            !Settings.canDrawOverlays(this)
-        ) return
-
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) return
         if (overlayView != null) return
 
-        val view = LayoutInflater.from(this)
-            .inflate(R.layout.activity_alert, null)
-
-        view.findViewById<TextView>(R.id.txtAlert).text =
-            "⚠ TOO CLOSE!\nKeep at least 35cm distance"
+        val view = LayoutInflater.from(this).inflate(R.layout.activity_alert, null)
+        view.findViewById<TextView>(R.id.txtAlert).text = "⚠ TOO CLOSE!\nKeep at least 35cm distance"
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP
             y = 100
         }
 
-        view.findViewById<Button>(R.id.btnDismiss)
-            .setOnClickListener { removeOverlay() }
-
+        view.findViewById<Button>(R.id.btnDismiss).setOnClickListener { removeOverlay() }
         windowManager.addView(view, params)
         overlayView = view
     }
 
     private fun removeOverlay() {
         overlayView?.let {
-            try {
-                windowManager.removeView(it)
-            } catch (_: Exception) {}
+            try { windowManager.removeView(it) } catch (_: Exception) {}
             overlayView = null
         }
     }
@@ -195,30 +243,21 @@ class DistanceMonitorService : LifecycleService() {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle("Too close to screen")
-            .setContentText("Please maintain at least 35cm distance")
+            .setContentText("Please maintain distance")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .build()
 
-        val manager =
-            getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(101, notification)
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+            .notify(DISTANCE_ALERT_ID, notification)
     }
 
     private fun createForegroundNotification(): Notification {
-        val stopIntent = Intent(this, DistanceMonitorService::class.java).apply {
-            action = ACTION_STOP
-        }
-
-        val stopPendingIntent = PendingIntent.getService(
-            this,
-            0,
-            stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+        val stopIntent = Intent(this, DistanceMonitorService::class.java).apply { action = ACTION_STOP }
+        val stopPendingIntent = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE)
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Eye Guard Protection")
-            .setContentText("Monitoring screen distance...")
+            .setContentTitle("Vision Guard Active")
+            .setContentText("Monitoring Distance & Posture")
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .addAction(0, "STOP", stopPendingIntent)
             .build()
@@ -226,13 +265,8 @@ class DistanceMonitorService : LifecycleService() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Distance Alerts",
-                NotificationManager.IMPORTANCE_HIGH
-            )
-            getSystemService(NotificationManager::class.java)
-                .createNotificationChannel(channel)
+            val channel = NotificationChannel(CHANNEL_ID, "Vision Guard Alerts", NotificationManager.IMPORTANCE_HIGH)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
     }
 
